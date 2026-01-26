@@ -1,0 +1,9 @@
+{
+  "name": "arbeitszeit-backend",
+  "version": "1.0.0",
+  "description": "Backend für Arbeitszeiterfassung",
+  "main": "api/cron.js",
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  }
+}
