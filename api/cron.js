@@ -1,7 +1,7 @@
 const admin = require("firebase-admin");
 
 export default async function handler(req, res) {
-  // 1. Initialisierung (Standard Vercel/Firebase Setup)
+  // --- 1. Initialisierung ---
   if (!admin.apps.length) {
     try {
       if (!process.env.FIREBASE_SERVICE_ACCOUNT) throw new Error("Key fehlt");
@@ -15,27 +15,20 @@ export default async function handler(req, res) {
   const db = admin.firestore();
 
   try {
-    // 2. Datum von heute bestimmen (Serverzeit)
-    const todayString = new Date().toISOString().split('T')[0]; // "2026-01-26"
+    // --- 2. Daten holen ---
+    const todayString = new Date().toISOString().split('T')[0];
     
-    // 3. Alle Daten holen (wir filtern gleich im Code)
     const snapshot = await db.collection("zeiterfassung").get();
     
     let events = [];
-
     snapshot.forEach(doc => {
       const data = doc.data();
-      
-      // WICHTIG: Prüfung, ob das Feld existiert und ein Timestamp-Objekt ist
       if (data.zeitstempel && typeof data.zeitstempel.toDate === 'function') {
         const dateObj = data.zeitstempel.toDate();
-        const dateIso = dateObj.toISOString(); // z.B. "2026-01-26T12:31:17.000Z"
-
-        // Nur Einträge von HEUTE behalten
-        if (dateIso.startsWith(todayString)) {
+        if (dateObj.toISOString().startsWith(todayString)) {
           events.push({
             id: doc.id,
-            status: data.status, // Ist direkt "KOMMEN" oder "GEHEN"
+            status: data.status,
             time: dateObj,
             millis: dateObj.getTime()
           });
@@ -43,38 +36,48 @@ export default async function handler(req, res) {
       }
     });
 
-    // 4. Sortieren (Chronologisch: Morgens -> Abends)
     events.sort((a, b) => a.millis - b.millis);
 
     if (events.length === 0) {
-      return res.status(200).json({ message: "Keine Daten für heute (" + todayString + ") gefunden." });
+      return res.status(200).json({ message: "Keine Daten für heute." });
     }
 
-    // 5. Berechnung der Zeiten
+    // --- HELFER: Uhrzeit formatieren (HH:MM) für Deutschland ---
+    function formatTime(dateObj) {
+      return dateObj.toLocaleTimeString('de-DE', { 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        timeZone: 'Europe/Berlin' // Wichtig, damit es deutsche Zeit ist!
+      });
+    }
+
+    // --- 3. Berechnungen & Listen bauen ---
     let workMinutes = 0;
     let breakMinutes = 0;
     let lastEvent = null;
-    let log = []; // Für Debugging-Zwecke im JSON
+    let breaksList = []; // Hier sammeln wir die Pausenzeiten für Format 2
 
     for (const event of events) {
       if (lastEvent) {
         const diffMin = (event.millis - lastEvent.millis) / 1000 / 60;
         
         if (lastEvent.status === "KOMMEN" && event.status === "GEHEN") {
-          // Das war Arbeitszeit
           workMinutes += diffMin;
-          log.push(`Arbeit: ${diffMin.toFixed(1)} Min`);
         } else if (lastEvent.status === "GEHEN" && event.status === "KOMMEN") {
-          // Das war Pause
           breakMinutes += diffMin;
-          log.push(`Pause: ${diffMin.toFixed(1)} Min`);
+          
+          // Für Format 2: Pause erfassen
+          breaksList.push({
+            start: formatTime(lastEvent.time),
+            end: formatTime(event.time)
+          });
         }
       }
       lastEvent = event;
     }
 
-    // 6. Das Ergebnis speichern (in neue Collection 'tagesberichte')
-    const summary = {
+    // --- 4. Speichern: Format 1 (Tagesbericht) ---
+    const summaryV1 = {
       datum: todayString,
       arbeitszeit_min: Math.round(workMinutes),
       pausen_min: Math.round(breakMinutes),
@@ -83,15 +86,27 @@ export default async function handler(req, res) {
       eintraege: events.length,
       erstellt_am: admin.firestore.FieldValue.serverTimestamp()
     };
+    
+    await db.collection("tagesberichte").doc(todayString).set(summaryV1);
 
-    // Wir nutzen .set(), das überschreibt den Eintrag für heute, falls man das Skript 2x aufruft
-    await db.collection("tagesberichte").doc(todayString).set(summary);
+    // --- 5. Speichern: Format 2 (Dein JSON-Wunsch) ---
+    // Wir nehmen die Zeit vom allerersten Event als Arbeitsbeginn
+    // und die Zeit vom allerletzten als Arbeitsende
+    const summaryV2 = {
+      work_start: formatTime(events[0].time),
+      work_end: formatTime(events[events.length - 1].time),
+      breaks: breaksList
+    };
 
-    // 7. Antwort an den Browser senden
+    // Speichern in Collection "JSON" unter dem Dokument "2026-01-26"
+    await db.collection("JSON").doc(todayString).set(summaryV2);
+
+    // --- 6. Antwort ---
     return res.status(200).json({
       success: true,
-      ergebnis: summary,
-      debug_ablauf: log
+      message: "Beide Formate gespeichert",
+      format_1: summaryV1,
+      format_2: summaryV2
     });
 
   } catch (error) {
