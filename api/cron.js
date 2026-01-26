@@ -1,53 +1,101 @@
 const admin = require("firebase-admin");
 
 export default async function handler(req, res) {
-  // Initialisierung (wie gehabt)
+  // 1. Initialisierung (Standard Vercel/Firebase Setup)
   if (!admin.apps.length) {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    try {
+      if (!process.env.FIREBASE_SERVICE_ACCOUNT) throw new Error("Key fehlt");
+      const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    } catch (e) {
+      return res.status(500).json({ error: "Init Fehler", details: e.message });
+    }
   }
 
   const db = admin.firestore();
 
   try {
-    // Wir holen einfach ALLE Daten (oder die letzten 10)
-    const snapshot = await db.collection("zeiterfassung").limit(10).get();
-
-    const debugInfos = [];
+    // 2. Datum von heute bestimmen (Serverzeit)
+    const todayString = new Date().toISOString().split('T')[0]; // "2026-01-26"
+    
+    // 3. Alle Daten holen (wir filtern gleich im Code)
+    const snapshot = await db.collection("zeiterfassung").get();
+    
+    let events = [];
 
     snapshot.forEach(doc => {
       const data = doc.data();
       
-      // Wir analysieren das Feld "zeitstempel"
-      let zeitstempelWert = data.zeitstempel;
-      let zeitstempelTyp = typeof data.zeitstempel;
-      let isFirestoreTimestamp = false;
-
-      // Prüfung: Ist es ein spezielles Firestore Timestamp Objekt?
+      // WICHTIG: Prüfung, ob das Feld existiert und ein Timestamp-Objekt ist
       if (data.zeitstempel && typeof data.zeitstempel.toDate === 'function') {
-        zeitstempelWert = data.zeitstempel.toDate().toISOString(); // Umwandeln in lesbaren String
-        zeitstempelTyp = "Firestore Object (Class)";
-        isFirestoreTimestamp = true;
-      }
+        const dateObj = data.zeitstempel.toDate();
+        const dateIso = dateObj.toISOString(); // z.B. "2026-01-26T12:31:17.000Z"
 
-      debugInfos.push({
-        id: doc.id,
-        status: data.status,
-        zeitstempel_roh: data.zeitstempel, // Was sieht Node.js wirklich?
-        zeitstempel_typ: zeitstempelTyp,
-        zeitstempel_konvertiert: zeitstempelWert
-      });
+        // Nur Einträge von HEUTE behalten
+        if (dateIso.startsWith(todayString)) {
+          events.push({
+            id: doc.id,
+            status: data.status, // Ist direkt "KOMMEN" oder "GEHEN"
+            time: dateObj,
+            millis: dateObj.getTime()
+          });
+        }
+      }
     });
 
-    // Wir geben das Ergebnis zurück, damit du es im Browser lesen kannst
+    // 4. Sortieren (Chronologisch: Morgens -> Abends)
+    events.sort((a, b) => a.millis - b.millis);
+
+    if (events.length === 0) {
+      return res.status(200).json({ message: "Keine Daten für heute (" + todayString + ") gefunden." });
+    }
+
+    // 5. Berechnung der Zeiten
+    let workMinutes = 0;
+    let breakMinutes = 0;
+    let lastEvent = null;
+    let log = []; // Für Debugging-Zwecke im JSON
+
+    for (const event of events) {
+      if (lastEvent) {
+        const diffMin = (event.millis - lastEvent.millis) / 1000 / 60;
+        
+        if (lastEvent.status === "KOMMEN" && event.status === "GEHEN") {
+          // Das war Arbeitszeit
+          workMinutes += diffMin;
+          log.push(`Arbeit: ${diffMin.toFixed(1)} Min`);
+        } else if (lastEvent.status === "GEHEN" && event.status === "KOMMEN") {
+          // Das war Pause
+          breakMinutes += diffMin;
+          log.push(`Pause: ${diffMin.toFixed(1)} Min`);
+        }
+      }
+      lastEvent = event;
+    }
+
+    // 6. Das Ergebnis speichern (in neue Collection 'tagesberichte')
+    const summary = {
+      datum: todayString,
+      arbeitszeit_min: Math.round(workMinutes),
+      pausen_min: Math.round(breakMinutes),
+      start: events[0].time.toISOString(),
+      ende: events[events.length - 1].time.toISOString(),
+      eintraege: events.length,
+      erstellt_am: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    // Wir nutzen .set(), das überschreibt den Eintrag für heute, falls man das Skript 2x aufruft
+    await db.collection("tagesberichte").doc(todayString).set(summary);
+
+    // 7. Antwort an den Browser senden
     return res.status(200).json({
-      nachricht: "Debug Modus - Zeige Rohdaten",
-      anzahl_gefunden: snapshot.size,
-      server_zeit_heute: new Date().toISOString().split('T')[0],
-      daten: debugInfos
+      success: true,
+      ergebnis: summary,
+      debug_ablauf: log
     });
 
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: error.message, stack: error.stack });
   }
 }
