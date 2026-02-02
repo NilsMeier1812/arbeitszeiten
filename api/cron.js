@@ -15,20 +15,19 @@ export default async function handler(req, res) {
   const db = admin.firestore();
 
   try {
-    // --- 2. Daten holen ---
+    // --- 2. Rohdaten holen ---
     const todayString = new Date().toISOString().split('T')[0];
-    
     const snapshot = await db.collection("zeiterfassung").get();
     
-    let events = [];
+    let rawEvents = [];
     snapshot.forEach(doc => {
       const data = doc.data();
       if (data.zeitstempel && typeof data.zeitstempel.toDate === 'function') {
         const dateObj = data.zeitstempel.toDate();
         if (dateObj.toISOString().startsWith(todayString)) {
-          events.push({
+          rawEvents.push({
             id: doc.id,
-            status: data.status,
+            status: data.status, // "KOMMEN" oder "GEHEN"
             time: dateObj,
             millis: dateObj.getTime()
           });
@@ -36,28 +35,66 @@ export default async function handler(req, res) {
       }
     });
 
-    events.sort((a, b) => a.millis - b.millis);
+    // Chronologisch sortieren
+    rawEvents.sort((a, b) => a.millis - b.millis);
 
-    if (events.length === 0) {
-      return res.status(200).json({ message: "Keine Daten für heute." });
+    // --- NEU: DER "BUS-FILTER" (Liste bereinigen) ---
+    // Wir bauen eine neue Liste "cleanEvents". 
+    // Wenn ein Event das vorherige extrem schnell aufhebt, löschen wir beide.
+    
+    const FILTER_THRESHOLD_MIN = 2.0; // Toleranz in Minuten (Busfahrt etc.)
+    let cleanEvents = [];
+
+    for (const event of rawEvents) {
+      // Wenn Liste leer, erst mal hinzufügen (z.B. das erste KOMMEN)
+      if (cleanEvents.length === 0) {
+        cleanEvents.push(event);
+        continue;
+      }
+
+      const lastValidEvent = cleanEvents[cleanEvents.length - 1];
+      const diffMin = (event.millis - lastValidEvent.millis) / 1000 / 60;
+
+      // PRÜFUNG: Ist das neue Event sehr kurz nach dem letzten?
+      // UND: Ist es ein Gegenteil? (Also KOMMEN->GEHEN oder GEHEN->KOMMEN)
+      if (diffMin < FILTER_THRESHOLD_MIN && event.status !== lastValidEvent.status) {
+        
+        // JA! Das war eine "Vorbeifahrt" oder ein GPS-Fehler.
+        // Strategie: Wir tun so, als wären BEIDE nie passiert.
+        
+        // 1. Wir entfernen das letzte Event aus der sauberen Liste (Pop)
+        cleanEvents.pop();
+        
+        // 2. Wir fügen das aktuelle Event ("event") gar nicht erst hinzu.
+        // -> Ergebnis: Beide löschen sich gegenseitig aus.
+
+      } else {
+        // Nein, alles normal (oder Zeitabstand groß genug). Hinzufügen.
+        cleanEvents.push(event);
+      }
     }
 
-    // --- HELFER: Uhrzeit formatieren (HH:MM) für Deutschland ---
+    // Checken ob nach dem Filtern noch was übrig ist
+    if (cleanEvents.length === 0) {
+      return res.status(200).json({ message: "Keine validen Daten für heute (alles ausgefiltert)." });
+    }
+
+    // --- HELFER: Uhrzeit formatieren ---
     function formatTime(dateObj) {
       return dateObj.toLocaleTimeString('de-DE', { 
         hour: '2-digit', 
         minute: '2-digit', 
-        timeZone: 'Europe/Berlin' // Wichtig, damit es deutsche Zeit ist!
+        timeZone: 'Europe/Berlin'
       });
     }
 
-    // --- 3. Berechnungen & Listen bauen ---
+    // --- 3. Berechnungen (jetzt mit der SAUBEREN Liste) ---
     let workMinutes = 0;
     let breakMinutes = 0;
+    let breaksList = []; 
     let lastEvent = null;
-    let breaksList = []; // Hier sammeln wir die Pausenzeiten für Format 2
 
-    for (const event of events) {
+    for (const event of cleanEvents) {
       if (lastEvent) {
         const diffMin = (event.millis - lastEvent.millis) / 1000 / 60;
         
@@ -65,8 +102,6 @@ export default async function handler(req, res) {
           workMinutes += diffMin;
         } else if (lastEvent.status === "GEHEN" && event.status === "KOMMEN") {
           breakMinutes += diffMin;
-          
-          // Für Format 2: Pause erfassen
           breaksList.push({
             start: formatTime(lastEvent.time),
             end: formatTime(event.time)
@@ -76,36 +111,32 @@ export default async function handler(req, res) {
       lastEvent = event;
     }
 
-    // --- 4. Speichern: Format 1 (Tagesbericht) ---
+    // --- 4. Speichern ---
     const summaryV1 = {
       datum: todayString,
       arbeitszeit_min: Math.round(workMinutes),
       pausen_min: Math.round(breakMinutes),
-      start: events[0].time.toISOString(),
-      ende: events[events.length - 1].time.toISOString(),
-      eintraege: events.length,
+      start: cleanEvents[0].time.toISOString(),
+      ende: cleanEvents[cleanEvents.length - 1].time.toISOString(),
+      eintraege: cleanEvents.length,
       erstellt_am: admin.firestore.FieldValue.serverTimestamp()
     };
     
     await db.collection("tagesberichte").doc(todayString).set(summaryV1);
 
-    // --- 5. Speichern: Format 2 (Dein JSON-Wunsch) ---
-    // Wir nehmen die Zeit vom allerersten Event als Arbeitsbeginn
-    // und die Zeit vom allerletzten als Arbeitsende
     const summaryV2 = {
-      work_start: formatTime(events[0].time),
-      work_end: formatTime(events[events.length - 1].time),
+      work_start: formatTime(cleanEvents[0].time),
+      work_end: formatTime(cleanEvents[cleanEvents.length - 1].time),
       breaks: breaksList
     };
 
-    // Speichern in Collection "JSON" unter dem Dokument "2026-01-26"
     await db.collection("JSON").doc(todayString).set(summaryV2);
 
-    // --- 6. Antwort ---
     return res.status(200).json({
       success: true,
-      message: "Beide Formate gespeichert",
-      format_1: summaryV1,
+      message: "Bus-Filter aktiv (" + FILTER_THRESHOLD_MIN + " Min)",
+      gefilterte_events: cleanEvents.length,
+      original_events: rawEvents.length,
       format_2: summaryV2
     });
 
