@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arbeitszeit Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg: #121212;
+            --card: #1e1e1e;
+            --text: #e0e0e0;
+            --accent: #4caf50; /* Grün für Arbeit */
+            --danger: #f44336; /* Rot für Pause/Minus */
+            --muted: #888;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        /* Header & Navigation */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        h1 { margin: 0; font-size: 1.5rem; }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+        }
+
+        button {
+            background: var(--card);
+            border: 1px solid #333;
+            color: var(--text);
+            padding: 8px 15px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        button:hover { background: #333; }
+        button.primary { background: var(--accent); color: #000; border: none; font-weight: bold; }
+
+        /* Kacheln für Stats */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: var(--card);
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+
+        .stat-label { font-size: 0.9rem; color: var(--muted); display: block; margin-bottom: 5px; }
+        .stat-value { font-size: 1.8rem; font-weight: bold; }
+        .stat-value.pos { color: var(--accent); }
+        .stat-value.neg { color: var(--danger); }
+
+        /* Chart */
+        .chart-container {
+            background: var(--card);
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            height: 350px;
+        }
+
+        /* Tabelle */
+        .table-container {
+            overflow-x: auto;
+            background: var(--card);
+            border-radius: 12px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 600px;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 15px;
+            border-bottom: 1px solid #333;
+        }
+
+        th { color: var(--muted); font-weight: 600; }
+        tr:last-child td { border-bottom: none; }
+        
+        .tag-pill {
+            background: #333;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <header>
+            <h1 id="monthTitle">Lade Daten...</h1>
+            <div class="controls">
+                <button onclick="changeMonth(-1)">◀</button>
+                <button onclick="changeMonth(1)">▶</button>
+                <button onclick="jumpToToday()">Heute</button>
+                <button class="primary" onclick="exportCSV()">Export CSV</button>
+            </div>
+        </header>
+
+        <div class="stats-grid">
+            <div class="card">
+                <span class="stat-label">Gesamt Arbeitszeit</span>
+                <span class="stat-value" id="totalWork">0h 00m</span>
+            </div>
+            <div class="card">
+                <span class="stat-label">Überstunden (Saldo)</span>
+                <span class="stat-value" id="overtime">0h 00m</span>
+            </div>
+            <div class="card">
+                <span class="stat-label"> Ø Pausenzeit</span>
+                <span class="stat-value" id="avgBreak">0 min</span>
+            </div>
+            <div class="card">
+                <span class="stat-label">Arbeitstage</span>
+                <span class="stat-value" id="daysCount">0</span>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="workChart"></canvas>
+        </div>
+
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Datum</th>
+                        <th>Start</th>
+                        <th>Ende</th>
+                        <th>Pause</th>
+                        <th>Arbeitszeit</th>
+                        <th>Saldo (8h)</th>
+                    </tr>
+                </thead>
+                <tbody id="tableBody">
+                    </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // --- KONFIGURATION ---
+        const DAILY_TARGET_HOURS = 8;
+        const TARGET_MINUTES = DAILY_TARGET_HOURS * 60;
+
+        // --- STATE ---
+        let currentDate = new Date();
+        let currentData = [];
+        let myChart = null;
+
+        // --- INIT ---
+        document.addEventListener('DOMContentLoaded', () => {
+            loadMonth();
+        });
+
+        // --- FUNKTIONEN ---
+
+        function changeMonth(delta) {
+            currentDate.setMonth(currentDate.getMonth() + delta);
+            loadMonth();
+        }
+
+        function jumpToToday() {
+            currentDate = new Date();
+            loadMonth();
+        }
+
+        async function loadMonth() {
+            const year = currentDate.getFullYear();
+            const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+
+            // Titel update
+            const monthName = currentDate.toLocaleString('de-DE', { month: 'long', year: 'numeric' });
+            document.getElementById('monthTitle').innerText = monthName;
+
+            // API Abruf
+            try {
+                const res = await fetch(`/api/month?year=${year}&month=${month}`);
+                const data = await res.json();
+                currentData = data;
+                renderDashboard(data);
+            } catch (err) {
+                console.error(err);
+                alert("Fehler beim Laden der Daten!");
+            }
+        }
+
+        function renderDashboard(data) {
+            let totalMin = 0;
+            let totalBreak = 0;
+            let saldo = 0;
+            const labels = [];
+            const values = [];
+            
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+
+            data.forEach(entry => {
+                // Berechnungen
+                totalMin += entry.arbeitszeit_min;
+                totalBreak += entry.pausen_min;
+                
+                const daySaldo = entry.arbeitszeit_min - TARGET_MINUTES;
+                saldo += daySaldo;
+
+                // Datum formatieren
+                const dateObj = new Date(entry.datum);
+                const dayStr = dateObj.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', weekday: 'short' });
+                
+                labels.push(dateObj.getDate() + '.'); // Für Chart
+                values.push(entry.arbeitszeit_min / 60); // Stunden für Chart
+
+                // Tabelle füllen
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td><span class="tag-pill">${dayStr}</span></td>
+                    <td>${formatTimeISO(entry.start)}</td>
+                    <td>${formatTimeISO(entry.ende)}</td>
+                    <td>${entry.pausen_min} min</td>
+                    <td style="font-weight:bold">${formatMinutes(entry.arbeitszeit_min)}</td>
+                    <td style="color: ${daySaldo >= 0 ? 'var(--accent)' : 'var(--danger)'}">
+                        ${daySaldo > 0 ? '+' : ''}${formatMinutes(daySaldo)}
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            // Stats Update
+            document.getElementById('totalWork').innerText = formatMinutes(totalMin);
+            document.getElementById('daysCount').innerText = data.length;
+            
+            const avgBreakVal = data.length ? Math.round(totalBreak / data.length) : 0;
+            document.getElementById('avgBreak').innerText = avgBreakVal + " min";
+
+            const saldoEl = document.getElementById('overtime');
+            saldoEl.innerText = (saldo > 0 ? '+' : '') + formatMinutes(saldo);
+            saldoEl.className = "stat-value " + (saldo >= 0 ? "pos" : "neg");
+
+            // Chart Update
+            renderChart(labels, values);
+        }
+
+        function renderChart(labels, dataWork) {
+            const ctx = document.getElementById('workChart').getContext('2d');
+            
+            if (myChart) myChart.destroy();
+
+            myChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Arbeitszeit (Stunden)',
+                        data: dataWork,
+                        backgroundColor: '#4caf50',
+                        borderRadius: 4
+                    },
+                    {
+                        label: 'Soll (8h)',
+                        data: Array(labels.length).fill(DAILY_TARGET_HOURS),
+                        type: 'line',
+                        borderColor: '#ffffff50',
+                        borderDash: [5, 5],
+                        pointRadius: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: { 
+                            beginAtZero: true, 
+                            grid: { color: '#333' },
+                            ticks: { color: '#888' } 
+                        },
+                        x: { 
+                            grid: { display: false },
+                            ticks: { color: '#888' }
+                        }
+                    },
+                    plugins: {
+                        legend: { labels: { color: '#e0e0e0' } }
+                    }
+                }
+            });
+        }
+
+        // --- HELPER ---
+        function formatMinutes(mins) {
+            const isNegative = mins < 0;
+            const absolute = Math.abs(mins);
+            const h = Math.floor(absolute / 60);
+            const m = absolute % 60;
+            return `${isNegative ? '-' : ''}${h}h ${String(m).padStart(2, '0')}m`;
+        }
+
+        function formatTimeISO(isoStr) {
+            if(!isoStr) return "-";
+            const d = new Date(isoStr);
+            return d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+        }
+
+        function exportCSV() {
+            if (!currentData.length) return alert("Keine Daten zum Exportieren!");
+            
+            let csv = "Datum;Wochentag;Start;Ende;Pause (Min);Arbeitszeit (Min);Stunden\n";
+            
+            currentData.forEach(row => {
+                const d = new Date(row.datum);
+                const tag = d.toLocaleDateString('de-DE', { weekday: 'long' });
+                const start = formatTimeISO(row.start);
+                const end = formatTimeISO(row.ende);
+                const hours = (row.arbeitszeit_min / 60).toFixed(2).replace('.', ','); // Deutsches Format
+
+                csv += `${row.datum};${tag};${start};${end};${row.pausen_min};${row.arbeitszeit_min};${hours}\n`;
+            });
+
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            const url = URL.createObjectURL(blob);
+            link.setAttribute("href", url);
+            link.setAttribute("download", `Zeiterfassung_${currentDate.toISOString().slice(0,7)}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+    </script>
+</body>
+</html>
